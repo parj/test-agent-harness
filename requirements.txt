@@ -1,0 +1,19 @@
+
+# --- LLM providers (Phase 1) ---
+# Only the provider(s) you set PROVIDER to actually need a valid API key at
+# runtime, but all three SDKs are imported by agent/providers/__init__.py's
+# lazy imports, so installing all three keeps that working regardless of
+# which one you pick.
+anthropic==0.116.0
+openai==2.44.0
+google-genai==2.10.0
+
+# --- Core (Phase 1) ---
+pydantic==2.13.4          # tool input schemas, validation
+
+# --- Persistence (Phase 2) ---
+asyncpg==0.31.0            # Postgres driver for sessions/messages/memories
+# Note: pgvector similarity search is done via raw SQL (embedding <=> query)
+# in memory/semantic.py, so no separate pgvector Python package is needed —
+# just the Postgres extension itself (already in the pgvector/pgvector:pg16
+# Docker image used by docker-compose.yml).
