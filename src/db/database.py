@@ -53,6 +53,61 @@ CREATE TABLE IF NOT EXISTS memories (
 
 CREATE INDEX IF NOT EXISTS memories_embedding_idx
     ON memories USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    sources JSONB NOT NULL DEFAULT '[]',
+    reasoning_effort TEXT NOT NULL DEFAULT 'medium',
+    require_approval BOOLEAN NOT NULL DEFAULT true,
+    status TEXT NOT NULL DEFAULT 'queued',
+    creator TEXT DEFAULT '',
+    logs JSONB NOT NULL DEFAULT '[]',
+    result_text TEXT DEFAULT '',
+    blocks JSONB NOT NULL DEFAULT '[]',
+    approval JSONB,
+    messages JSONB NOT NULL DEFAULT '[]',
+    started_at DOUBLE PRECISION,
+    duration_ms INTEGER,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    context_pct DOUBLE PRECISION NOT NULL DEFAULT 0,
+    trace_id TEXT,
+    created_at DOUBLE PRECISION NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS tasks_created_at_idx ON tasks (created_at);
+
+-- CREATE TABLE IF NOT EXISTS above won't add columns to a tasks table that
+-- already existed before context_pct/trace_id were introduced — patch them
+-- in directly.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS context_pct DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS trace_id TEXT;
+
+-- Usage profiling: raw per-turn activity, folded nightly into a bounded
+-- per-user profile so the learning doesn't grow forever (see memory/consolidate.py).
+CREATE TABLE IF NOT EXISTS activity_log (
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    ts TIMESTAMPTZ DEFAULT now(),
+    event_type TEXT NOT NULL,      -- chat_query | task_created | query_data
+    summary TEXT NOT NULL,
+    agent TEXT,
+    source TEXT,
+    metadata JSONB
+);
+
+CREATE INDEX IF NOT EXISTS activity_log_user_ts_idx ON activity_log (user_id, ts);
+
+CREATE TABLE IF NOT EXISTS user_profiles (
+    user_id TEXT PRIMARY KEY,
+    profile_text TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    consolidated_through TIMESTAMPTZ
+);
 """
 
 
@@ -60,7 +115,7 @@ async def init_db():
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(DDL)
-    print("Schema ready: sessions, messages, memories.")
+    print("Schema ready: sessions, messages, memories, tasks, activity_log, user_profiles.")
 
 
 if __name__ == "__main__":

@@ -12,10 +12,14 @@ and resumes with the decision. Without a handler the tool is skipped and
 the model is told why (the old Phase-1 behaviour).
 """
 import asyncio
+import time
 from dataclasses import dataclass
 
+import observability
+from agent.compaction import compact_messages
 from agent.providers import get_provider
-from config import settings
+from config import context_window, settings
+from observability import tracer
 from tools.base import execute_tool, get_tool, get_tool_schemas
 
 SYSTEM_PROMPT = """You are a finance operations assistant. You have access to tools \
@@ -70,11 +74,27 @@ class AgentRuntime:
         tool_schemas = get_tool_schemas()
 
         for iteration in range(settings.max_tool_iterations):
-            response = await asyncio.to_thread(
-                self.provider.complete, messages,
-                system=active_system_prompt, tools=tool_schemas,
-                reasoning_effort=reasoning_effort,
-            )
+            with tracer.start_as_current_span("llm.complete") as span:
+                span.set_attribute("llm.provider", settings.provider)
+                span.set_attribute("llm.iteration", iteration)
+                call_started = time.monotonic()
+                response = await asyncio.to_thread(
+                    self.provider.complete, messages,
+                    system=active_system_prompt, tools=tool_schemas,
+                    reasoning_effort=reasoning_effort,
+                )
+                span.set_attribute("llm.input_tokens", response.input_tokens)
+                span.set_attribute("llm.output_tokens", response.output_tokens)
+                span.set_attribute("llm.tool_calls", len(response.tool_calls))
+                if observability.llm_call_duration_ms is not None:
+                    observability.llm_call_duration_ms.record(
+                        (time.monotonic() - call_started) * 1000, {"provider": settings.provider}
+                    )
+                if observability.llm_tokens_counter is not None:
+                    observability.llm_tokens_counter.add(
+                        response.input_tokens, {"provider": settings.provider, "direction": "input"})
+                    observability.llm_tokens_counter.add(
+                        response.output_tokens, {"provider": settings.provider, "direction": "output"})
 
             if on_event:
                 on_event("llm_call", {
@@ -83,6 +103,16 @@ class AgentRuntime:
                     "input_tokens": response.input_tokens,
                     "output_tokens": response.output_tokens,
                 })
+
+            window = context_window()
+            pct = response.input_tokens / window if window else 0.0
+            if on_event:
+                on_event("context_usage", {"pct": pct, "input_tokens": response.input_tokens,
+                                           "window": window})
+            if pct >= settings.context_compact_ratio:
+                messages = await compact_messages(messages, self.provider)
+                if on_event:
+                    on_event("context_compacted", {"pct_before": pct})
 
             messages.append({
                 "role": "assistant",
@@ -147,14 +177,22 @@ class AgentRuntime:
                 if on_event:
                     on_event("tool_start", {"tool": call.name, "input": call.input})
 
-                try:
-                    result = await execute_tool(call.name, call.input)
-                    result_text = (
-                        result.model_dump_json()
-                        if hasattr(result, "model_dump_json") else _to_json(result)
-                    )
-                except Exception as e:
-                    result_text = f"Tool error: {e}"
+                with tracer.start_as_current_span("tool.execute") as span:
+                    span.set_attribute("tool.name", call.name)
+                    tool_started = time.monotonic()
+                    try:
+                        result = await execute_tool(call.name, call.input)
+                        result_text = (
+                            result.model_dump_json()
+                            if hasattr(result, "model_dump_json") else _to_json(result)
+                        )
+                    except Exception as e:
+                        span.set_attribute("tool.error", str(e))
+                        result_text = f"Tool error: {e}"
+                    if observability.tool_duration_ms is not None:
+                        observability.tool_duration_ms.record(
+                            (time.monotonic() - tool_started) * 1000, {"tool": call.name}
+                        )
 
                 if on_event:
                     on_event("tool_result", {"tool": call.name, "result": result_text})

@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    image: dhi.io/pgvector:0.8-pg18
     ports: ["5432:5432"]
     environment:
       POSTGRES_DB: finops

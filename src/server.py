@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -28,12 +29,19 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import observability
 import tools  # noqa: F401 — registers query_data / list_sources
 from agent.runtime import AgentRuntime, ApprovalDecision, SYSTEM_PROMPT
 from cache.manager import get_cache
 from config import settings
 from datasources.registry import get_manager
+from db import tasks_store
+from memory import activity as activity_module
+from memory import consolidate as consolidate_module
 from memory import skills as skills_module
+from observability import record_rum_event
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------- #
 # Agent roster (mirrors the FinAgent design)
@@ -52,6 +60,21 @@ AGENT_DEFS = [
     {"name": "Audit Agent", "type": "Audit & Compliance", "icon": "🛡", "bg": "#1a1a2a",
      "skill": None, "sources": ["finops_erp", "bank_feed"]},
 ]
+
+
+# Approximate USD-per-1M-token pricing, keyed by the configured chat provider.
+# This is a rough operator-facing estimate, not a billing-accurate figure.
+_TOKEN_PRICING = {
+    "anthropic": {"input": 3.00, "output": 15.00},
+    "openai": {"input": 0.15, "output": 0.60},
+    "gemini": {"input": 1.25, "output": 5.00},
+    "stub": {"input": 0.0, "output": 0.0},
+}
+
+
+def _estimate_llm_cost(input_tokens: int, output_tokens: int) -> float:
+    rates = _TOKEN_PRICING.get(settings.provider, {"input": 0.0, "output": 0.0})
+    return (input_tokens * rates["input"] + output_tokens * rates["output"]) / 1_000_000
 
 
 @dataclass
@@ -85,7 +108,7 @@ class Task:
     sources: list[str]
     reasoning_effort: str = "medium"
     require_approval: bool = True
-    status: str = "queued"          # queued | running | approval | complete | failed | denied
+    status: str = "queued"          # queued | running | approval | pending_user | complete | failed | denied
     created_at: float = field(default_factory=time.time)
     creator: str = ""
     logs: list[dict] = field(default_factory=list)
@@ -94,6 +117,12 @@ class Task:
     approval: Optional[dict] = None
     messages: list[dict] = field(default_factory=list)
     updated_at: float = field(default_factory=time.time)
+    started_at: Optional[float] = None
+    duration_ms: Optional[int] = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    context_pct: float = 0.0
+    trace_id: Optional[str] = None
     # Not serialized: set while the runtime is paused waiting on a decision.
     approval_event: Optional[asyncio.Event] = field(default=None, repr=False)
     approval_decision: Optional[dict] = field(default=None, repr=False)
@@ -105,6 +134,12 @@ class Task:
             "require_approval": self.require_approval, "status": self.status,
             "created_at": self.created_at, "updated_at": self.updated_at,
             "creator": self.creator, "approval": self.approval,
+            "started_at": self.started_at, "duration_ms": self.duration_ms,
+            "input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
+            "estimated_llm_cost": round(_estimate_llm_cost(self.input_tokens, self.output_tokens), 4),
+            "context_pct": round(self.context_pct, 4),
+            "trace_id": self.trace_id,
+            "trace_url": f"{settings.signoz_url}/trace/{self.trace_id}" if self.trace_id else None,
         }
         if with_detail:
             base["logs"] = self.logs
@@ -153,16 +188,45 @@ def _now_hhmm() -> str:
     return dt.datetime.now().strftime("%H:%M")
 
 
+def _task_row(task: Task) -> dict:
+    return {
+        "id": task.id, "title": task.title, "description": task.description,
+        "agent": task.agent, "sources": task.sources,
+        "reasoning_effort": task.reasoning_effort, "require_approval": task.require_approval,
+        "status": task.status, "creator": task.creator,
+        "logs": task.logs, "result_text": task.result_text, "blocks": task.blocks,
+        "approval": task.approval, "messages": task.messages,
+        "started_at": task.started_at, "duration_ms": task.duration_ms,
+        "input_tokens": task.input_tokens, "output_tokens": task.output_tokens,
+        "context_pct": task.context_pct, "trace_id": task.trace_id,
+        "created_at": task.created_at, "updated_at": task.updated_at,
+    }
+
+
+def _persist_task(task: Task):
+    """Fire-and-forget mirror to Postgres so tasks survive a restart —
+    best-effort: a Postgres outage degrades to the old in-memory-only
+    behaviour rather than failing the request."""
+    async def _save():
+        try:
+            await tasks_store.save_task(_task_row(task))
+        except Exception as e:
+            logger.warning("Task persistence failed for %s: %s", task.id, e)
+    asyncio.create_task(_save())
+
+
 def _log(task: Task, text: str, color: str = "#666"):
     entry = {"time": _now_hhmm(), "text": text, "color": color}
     task.logs.append(entry)
     task.updated_at = time.time()
     bus.publish("log", {"task_id": task.id, "entry": entry})
+    _persist_task(task)
 
 
 def _task_changed(task: Task):
     task.updated_at = time.time()
     bus.publish("task", task.to_json())
+    _persist_task(task)
 
 
 def _agents_changed():
@@ -243,7 +307,7 @@ def _abbrev(v: float) -> str:
     return f"{v:,.0f}"
 
 
-def _system_prompt_for(task_agent: str) -> str:
+async def _system_prompt_for(task_agent: str) -> str:
     definition = agents[task_agent].definition if task_agent in agents else None
     parts = [SYSTEM_PROMPT]
     manager = get_manager()
@@ -256,7 +320,27 @@ def _system_prompt_for(task_agent: str) -> str:
         skill = skills_module.get_skill(definition["skill"])
         if skill:
             parts.append(f"\n\n## Active skill: {skill.name}\n{skill.instructions}")
+    try:
+        profile_text = await consolidate_module.get_profile_text(settings.demo_user)
+    except Exception:
+        profile_text = ""
+    if profile_text:
+        parts.append(f"\n\n## What we know about this user's habits\n{profile_text}")
     return "\n".join(parts)
+
+
+def _record_activity(event_type: str, summary: str, agent: str | None = None,
+                      source: str | None = None, metadata: dict | None = None):
+    """Fire-and-forget usage-activity capture — feeds the nightly profile
+    consolidation job. Best-effort: a Postgres outage must never break the
+    request this is attached to."""
+    async def _save():
+        try:
+            await activity_module.record(settings.demo_user, event_type, summary,
+                                         agent=agent, source=source, metadata=metadata)
+        except Exception as e:
+            logger.warning("Activity logging failed: %s", e)
+    asyncio.create_task(_save())
 
 
 async def _run_task(task: Task):
@@ -269,6 +353,7 @@ async def _run_task(task: Task):
         _agents_changed()
 
     task.status = "running"
+    task.started_at = time.time()
     _log(task, f"Task started — agent: {task.agent}", "#666")
     _log(task, f"Datasources: {', '.join(task.sources) or 'default'}", "#666")
     _task_changed(task)
@@ -278,10 +363,24 @@ async def _run_task(task: Task):
         if agent:
             agent.progress = min(90, agent.progress + 18)
         if kind == "llm_call":
+            task.input_tokens += data.get("input_tokens", 0)
+            task.output_tokens += data.get("output_tokens", 0)
             _log(task, f"LLM call ({data['provider']}, iteration {data['iteration']})", "#666")
+            _task_changed(task)
         elif kind == "tool_start":
             sql = (data.get("input") or {}).get("sql", "")
             _log(task, f"▶ query_data: {sql[:90]}", "#22c55e")
+            _record_activity("query_data", sql, agent=task.agent,
+                             source=(data.get("input") or {}).get("source"))
+        elif kind == "context_usage":
+            task.context_pct = data["pct"]
+            if data["pct"] >= settings.context_warn_ratio:
+                _log(task, f"⚠ Context {data['pct'] * 100:.0f}% full — will auto-compact soon",
+                     "#f59e0b")
+            _task_changed(task)
+        elif kind == "context_compacted":
+            _log(task, "↻ Conversation compacted to stay within the model's context window",
+                 "#3b9eff")
         elif kind == "tool_result":
             try:
                 payload = json.loads(data.get("result", "{}"))
@@ -293,6 +392,9 @@ async def _run_task(task: Task):
                         bus.add_feed("✓", f"Cache refreshed: {payload.get('cached_as') or payload.get('source')}")
                     if agent:
                         agent.cost += (payload.get("row_count", 0) / 1_000_000) * 0.05 + 0.005
+                    if observability.cache_result_counter is not None:
+                        observability.cache_result_counter.add(
+                            1, {"result": "hit" if payload.get("cache_hit") else "miss"})
             except (json.JSONDecodeError, TypeError):
                 pass
         elif kind == "approval_needed":
@@ -342,14 +444,22 @@ async def _run_task(task: Task):
 
     try:
         conversation = task.messages or [{"role": "user", "content": task.description}]
-        final_text, messages = await runtime.run(
-            conversation,
-            on_event=on_event,
-            system_prompt=_system_prompt_for(task.agent),
-            approval_handler=approval_handler,
-            approvals_enabled=task.require_approval,
-            reasoning_effort=task.reasoning_effort,
-        )
+        with observability.tracer.start_as_current_span("agent.task") as span:
+            span.set_attribute("task.id", task.id)
+            span.set_attribute("task.agent", task.agent)
+            span.set_attribute("task.title", task.title)
+            span_ctx = span.get_span_context()
+            if span_ctx.is_valid:
+                task.trace_id = format(span_ctx.trace_id, "032x")
+                _task_changed(task)
+            final_text, messages = await runtime.run(
+                conversation,
+                on_event=on_event,
+                system_prompt=await _system_prompt_for(task.agent),
+                approval_handler=approval_handler,
+                approvals_enabled=task.require_approval,
+                reasoning_effort=task.reasoning_effort,
+            )
         new_messages = messages[len(conversation):]
         task.messages = messages
         task.result_text = final_text
@@ -358,25 +468,70 @@ async def _run_task(task: Task):
             m.get("role") == "tool_result" and str(m.get("content", "")).startswith("Denied by user")
             for m in messages
         )
-        task.status = "denied" if denied else "complete"
-        _log(task, "✓ Complete" if task.status == "complete" else "✕ Ended after denial",
-             "#3b9eff" if task.status == "complete" else "#ef4444")
-        bus.add_feed("✓" if task.status == "complete" else "✕",
-                     f"{task.agent} finished: {task.title}")
+        tool_error = next(
+            (str(m.get("content", "")) for m in messages
+             if m.get("role") == "tool_result" and str(m.get("content", "")).startswith("Tool error:")),
+            None,
+        )
+        if denied:
+            task.status = "denied"
+        elif tool_error is not None:
+            task.status = "failed"
+        else:
+            # Not "complete" yet — the agent may still get a follow-up
+            # question from the user. _watch_pending_timeout auto-completes
+            # it after a period of inactivity (see config.task_followup_idle_seconds).
+            task.status = "pending_user"
+        _status_log = {
+            "pending_user": "⏸ Awaiting your reply",
+            "denied": "✕ Ended after denial",
+            "failed": f"✕ Failed: {tool_error}",
+        }
+        _status_color = {"pending_user": "#a78bfa", "denied": "#ef4444", "failed": "#ef4444"}
+        _status_icon = {"pending_user": "⏸", "denied": "✕", "failed": "✕"}
+        _log(task, _status_log[task.status], _status_color[task.status])
+        bus.add_feed(_status_icon[task.status], f"{task.agent} finished: {task.title}")
     except Exception as e:
         task.status = "failed"
         _log(task, f"✕ Failed: {e}", "#ef4444")
         bus.add_feed("✕", f"{task.agent} failed: {task.title} — {e}")
     finally:
+        if task.started_at is not None:
+            task.duration_ms = int((time.time() - task.started_at) * 1000)
+            if observability.task_duration_ms is not None:
+                observability.task_duration_ms.record(task.duration_ms, {"agent": task.agent})
+        if observability.task_counter is not None:
+            observability.task_counter.add(1, {"agent": task.agent, "status": task.status})
         if agent:
             agent.status = "idle"
             agent.current_task = None
             agent.current_task_title = None
             agent.progress = 0
-            if task.status == "complete":
-                agent.tasks_completed += 1
             _agents_changed()
         _task_changed(task)
+        if task.status == "pending_user":
+            asyncio.create_task(_watch_pending_timeout(task, task.updated_at))
+
+
+async def _watch_pending_timeout(task: Task, marker: float, delay: float | None = None):
+    """Auto-completes a task that's been sitting in pending_user with no
+    follow-up. `marker` pins this watcher to the specific pending_user
+    transition it was scheduled for — if a follow-up came in (and moved
+    updated_at) before the timer fires, this is a stale watcher and no-ops,
+    the newer follow-up's own run will schedule its own watcher."""
+    await asyncio.sleep(settings.task_followup_idle_seconds if delay is None else max(0.0, delay))
+    if task.status != "pending_user" or task.updated_at != marker:
+        return
+    task.status = "complete"
+    agent = agents.get(task.agent)
+    if agent:
+        agent.tasks_completed += 1
+        _agents_changed()
+    if observability.task_counter is not None:
+        observability.task_counter.add(1, {"agent": task.agent, "status": task.status})
+    _log(task, "✓ Marked complete — no follow-up in the last hour", "#3b9eff")
+    bus.add_feed("✓", f"{task.agent} auto-completed: {task.title}")
+    _task_changed(task)
 
 
 # --------------------------------------------------------------------- #
@@ -419,8 +574,70 @@ class AskTaskBody(BaseModel):
     message: str
 
 
+class RumBody(BaseModel):
+    events: list[dict]
+
+
 # --------------------------------------------------------------------- #
 app = FastAPI(title="FinAgent")
+observability.setup_telemetry(app)
+
+
+@app.on_event("startup")
+async def _load_persisted_tasks():
+    try:
+        from db.database import init_db
+        await init_db()
+        rows = await tasks_store.load_tasks()
+    except Exception as e:
+        logger.warning("Task persistence unavailable (Postgres not reachable?): %s", e)
+        return
+    for row in rows:
+        task = Task(
+            id=row["id"], title=row["title"], description=row["description"],
+            agent=row["agent"], sources=row["sources"] or [],
+            reasoning_effort=row["reasoning_effort"], require_approval=row["require_approval"],
+            status=row["status"], created_at=row["created_at"], creator=row["creator"] or "",
+            logs=row["logs"] or [], result_text=row["result_text"] or "",
+            blocks=row["blocks"] or [], approval=row["approval"], messages=row["messages"] or [],
+            updated_at=row["updated_at"], started_at=row["started_at"], duration_ms=row["duration_ms"],
+            input_tokens=row["input_tokens"] or 0, output_tokens=row["output_tokens"] or 0,
+            context_pct=row.get("context_pct") or 0.0, trace_id=row.get("trace_id"),
+        )
+        if task.status in ("queued", "running", "approval"):
+            task.status = "failed"
+            task.approval = None
+            _log(task, "✕ Interrupted — server restarted before this task finished", "#ef4444")
+        elif task.status == "pending_user":
+            remaining = settings.task_followup_idle_seconds - (time.time() - task.updated_at)
+            asyncio.create_task(_watch_pending_timeout(task, task.updated_at, remaining))
+        tasks[task.id] = task
+    logger.info("Loaded %d persisted task(s) from Postgres.", len(rows))
+
+
+async def _nightly_consolidation_loop():
+    """Runs memory.consolidate.consolidate_all_users() once a day at
+    settings.consolidation_hour_utc — the 'compact and sleep' step that
+    folds raw activity_log rows into each user's bounded profile. Runs for
+    the lifetime of the server process; a Postgres/LLM outage on any given
+    night is logged and simply retried the following night."""
+    while True:
+        now = dt.datetime.utcnow()
+        next_run = now.replace(hour=settings.consolidation_hour_utc, minute=0,
+                               second=0, microsecond=0)
+        if next_run <= now:
+            next_run += dt.timedelta(days=1)
+        await asyncio.sleep((next_run - now).total_seconds())
+        try:
+            results = await consolidate_module.consolidate_all_users()
+            bus.add_feed("🌙", f"Nightly consolidation: updated {len(results)} user profile(s)")
+        except Exception as e:
+            logger.warning("Nightly consolidation failed: %s", e)
+
+
+@app.on_event("startup")
+async def _start_nightly_scheduler():
+    asyncio.create_task(_nightly_consolidation_loop())
 
 
 @app.get("/api/overview")
@@ -485,6 +702,8 @@ async def create_task(body: CreateTaskBody):
     )
     tasks[task.id] = task
     _task_changed(task)
+    _record_activity("task_created", body.description, agent=body.agent,
+                     source=(body.sources[0] if body.sources else None))
     asyncio.create_task(_run_task(task))
     return task.to_json()
 
@@ -540,6 +759,29 @@ async def ask_task(task_id: str, body: AskTaskBody):
 @app.get("/api/agents")
 async def list_agents():
     return {"agents": [a.to_json() for a in agents.values()]}
+
+
+@app.get("/api/profile")
+async def get_profile():
+    """The learned usage profile for the current demo user — built up by
+    the nightly consolidation job from activity_log (see memory/consolidate.py).
+    Best-effort: returns an empty profile rather than failing if Postgres or
+    the profile isn't available yet."""
+    try:
+        from db.database import get_pool
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT profile_text, updated_at FROM user_profiles WHERE user_id = $1",
+                settings.demo_user,
+            )
+    except Exception as e:
+        return {"user": settings.demo_user, "profile_text": "", "updated_at": None,
+                "error": f"Profile unavailable: {e}"}
+    if row is None:
+        return {"user": settings.demo_user, "profile_text": "", "updated_at": None}
+    return {"user": settings.demo_user, "profile_text": row["profile_text"],
+            "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None}
 
 
 @app.get("/api/sources")
@@ -624,15 +866,32 @@ async def query_chat(body: QueryBody):
     session_id = body.session_id or uuid.uuid4().hex[:12]
     conversation = chat_sessions.setdefault(session_id, [])
     conversation.append({"role": "user", "content": body.message})
+    _record_activity("chat_query", body.message)
 
-    final_text, messages = await runtime.run(
-        list(conversation),
-        system_prompt=_system_prompt_for("Variance Agent"),
-        approvals_enabled=False,   # interactive chat: user is already present
-    )
+    context_state = {"pct": 0.0, "compacted": False}
+
+    def on_event(kind: str, data: dict):
+        if kind == "context_usage":
+            context_state["pct"] = data["pct"]
+        elif kind == "context_compacted":
+            context_state["compacted"] = True
+
+    with observability.tracer.start_as_current_span("agent.chat") as span:
+        span.set_attribute("chat.session_id", session_id)
+        final_text, messages = await runtime.run(
+            list(conversation),
+            on_event=on_event,
+            system_prompt=await _system_prompt_for("Variance Agent"),
+            approvals_enabled=False,   # interactive chat: user is already present
+        )
     chat_sessions[session_id] = messages
     blocks = _result_blocks_from_messages(messages[len(conversation):], final_text)
-    return {"session_id": session_id, "blocks": blocks}
+    return {
+        "session_id": session_id, "blocks": blocks,
+        "context_pct": round(context_state["pct"], 4),
+        "context_warning": context_state["pct"] >= settings.context_warn_ratio,
+        "compacted": context_state["compacted"],
+    }
 
 
 @app.post("/api/sql")
@@ -726,6 +985,21 @@ async def analysis_pivot(source: str = "finops_erp", table: str = "gl_entries"):
             "backend": cache.backend.label,
         },
     }
+
+
+@app.post("/api/rum")
+async def rum_ingest(body: RumBody):
+    """Receives batched client-side RUM events (clicks, page-load timing,
+    per-SPA-view duration — see static/rum.js) and turns each into a span +
+    metric point on the finagent-web OTel service. Fire-and-forget from the
+    browser's perspective: this always returns 202 even if telemetry export
+    itself later fails in the background."""
+    for event in body.events[:200]:
+        try:
+            record_rum_event(event)
+        except Exception as e:
+            logger.warning("RUM event dropped: %s", e)
+    return {"accepted": len(body.events)}
 
 
 @app.websocket("/ws")
