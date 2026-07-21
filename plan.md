@@ -34,6 +34,21 @@ Tracks actual progress against the original 6-phase plan. "Tested" means verifie
 | Frontend: session sidebar, skill launcher | ❌ Not built — no frontend exists yet at all |
  
 **What "done" looks like for Phase 2:** run `docker compose up -d` + `python -m db.database` locally, confirm schema creates cleanly, then the session/memory code needs a real end-to-end test — start a conversation, close it, start a new one, confirm a fact from the first session shows up in the second. That loop hasn't been run.
+
+**Usage profiling (added later, separate from the session/memory glue above):**
+
+| Item | Status |
+|---|---|
+| `activity_log` + `user_profiles` tables, nightly consolidation (`memory/consolidate.py`), in-process scheduler in `server.py` | ✅ Tested live against real Postgres — activity capture, consolidation, retention pruning, and `GET /api/profile` all verified end-to-end with the stub provider |
+| Profile injected into agent system prompt (`_system_prompt_for`) | ✅ Wired, best-effort (empty string if Postgres/profile unavailable) |
+| "My Usage" UI panel | ✅ Written — not yet screenshot-verified in a browser |
+
+**Context-window compaction (also added later):**
+
+| Item | Status |
+|---|---|
+| Per-provider context window config + 75%-full warning + auto-compact at 90% (`agent/compaction.py`, wired into `agent/runtime.py`) | ✅ Tested — `tests/test_compaction.py`, plus live-server verification of `context_pct`/`compacted` on `/api/query` responses |
+| Task detail + chat UI banners for the warning/compaction state | ✅ Written — not yet screenshot-verified in a browser |
  
 ---
  

@@ -8,6 +8,31 @@ const esc = (s) => String(s ?? '')
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
+/* Coalesces render() calls that land in the same tick (e.g. a 'log' and a
+   'task' WS message for the same LLM call) into one, so the task panel
+   doesn't tear down and rebuild twice back-to-back. */
+let _renderScheduled = false;
+let _afterRenderCbs = [];
+function scheduleRender(afterCb) {
+  if (afterCb) _afterRenderCbs.push(afterCb);
+  if (_renderScheduled) return;
+  _renderScheduled = true;
+  const flush = () => {
+    if (!_renderScheduled) return; // already flushed by the other path below
+    _renderScheduled = false;
+    render();
+    const cbs = _afterRenderCbs; _afterRenderCbs = [];
+    cbs.forEach(cb => cb());
+  };
+  requestAnimationFrame(flush);
+  // requestAnimationFrame is paused while the tab is backgrounded, so a
+  // status change that lands then (e.g. a task going pending_user and
+  // re-enabling the reply box) would otherwise sit un-rendered — reply
+  // input looks "stuck" disabled — until some unrelated repaint happens.
+  // This timeout fallback guarantees it catches up regardless of visibility.
+  setTimeout(flush, 250);
+}
+
 /* Minimal markdown -> HTML for LLM-written text blocks (headings, bold/italic,
    inline code, code fences, lists, links). Escapes first, then only ever
    inserts tags around already-escaped text, so it stays XSS-safe. */
@@ -17,6 +42,19 @@ function mdInline(s) {
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, '$1<em>$2</em>')
     .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+}
+const _isTableSep = (s) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(s);
+function _splitTableRow(line) {
+  let s = line.trim();
+  if (s.startsWith('|')) s = s.slice(1);
+  if (s.endsWith('|')) s = s.slice(0, -1);
+  return s.split(/(?<!\\)\|/).map(c => c.trim().replace(/\\\|/g, '|'));
+}
+function _renderTable(header, aligns, rows) {
+  const cell = (tag, c, idx) => `<${tag} style="text-align:${aligns[idx] || 'left'}">${mdInline(c ?? '')}</${tag}>`;
+  const thead = `<tr>${header.map((c, idx) => cell('th', c, idx)).join('')}</tr>`;
+  const tbody = rows.map(r => `<tr>${header.map((_, idx) => cell('td', r[idx], idx)).join('')}</tr>`).join('');
+  return `<div class="md-table-wrap"><table class="md-table"><thead>${thead}</thead><tbody>${tbody}</tbody></table></div>`;
 }
 function mdToHtml(text) {
   const lines = String(text ?? '').replace(/\r\n/g, '\n').split('\n');
@@ -60,13 +98,33 @@ function mdToHtml(text) {
       i++;
       continue;
     }
+    if (line.includes('|') && i + 1 < lines.length && _isTableSep(lines[i + 1])) {
+      flushList();
+      const header = _splitTableRow(line);
+      const aligns = _splitTableRow(lines[i + 1]).map(c => {
+        const t = c.trim();
+        if (/^:-+:$/.test(t)) return 'center';
+        if (/^-+:$/.test(t)) return 'right';
+        if (/^:-+$/.test(t)) return 'left';
+        return '';
+      });
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].trim() !== '' && lines[i].includes('|')) {
+        rows.push(_splitTableRow(lines[i]));
+        i++;
+      }
+      out.push(_renderTable(header, aligns, rows));
+      continue;
+    }
     flushList();
     if (line.trim() === '') { i++; continue; }
     const para = [line];
     i++;
     while (i < lines.length && lines[i].trim() !== ''
            && !/^(#{1,6})\s+/.test(lines[i]) && !/^\s*[-*]\s+/.test(lines[i])
-           && !/^\s*\d+\.\s+/.test(lines[i]) && !lines[i].trim().startsWith('```')) {
+           && !/^\s*\d+\.\s+/.test(lines[i]) && !lines[i].trim().startsWith('```')
+           && !(lines[i].includes('|') && i + 1 < lines.length && _isTableSep(lines[i + 1]))) {
       para.push(lines[i]);
       i++;
     }
@@ -96,6 +154,17 @@ function fmtNum(v) {
   if (Number.isNaN(n)) return String(v);
   return n.toLocaleString('en-US', { maximumFractionDigits: 0 });
 }
+function fmtDuration(ms) {
+  if (ms == null) return '—';
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(1)}s`;
+  const m = Math.floor(s / 60);
+  return `${m}m ${Math.round(s % 60)}s`;
+}
+function fmtCost(v) {
+  if (v == null) return '—';
+  return v < 0.01 && v > 0 ? '<$0.01' : `$${v.toFixed(2)}`;
+}
 function abbrev(v) {
   const n = Number(v) || 0;
   const sign = n < 0 ? '-' : '+';
@@ -109,10 +178,12 @@ const STATUS_STYLE = {
   queued:   { label: 'QUEUED',   color: '#555',    bg: 'rgba(85,85,85,0.15)',   text: '#888' },
   running:  { label: 'RUNNING',  color: '#22c55e', bg: 'rgba(34,197,94,0.15)',  text: '#22c55e' },
   approval: { label: 'APPROVAL', color: '#f59e0b', bg: 'rgba(245,158,11,0.15)', text: '#f59e0b' },
+  pending_user: { label: 'AWAITING REPLY', color: '#a78bfa', bg: 'rgba(167,139,250,0.15)', text: '#a78bfa' },
   complete: { label: 'COMPLETE', color: '#3b9eff', bg: 'rgba(59,158,255,0.15)', text: '#3b9eff' },
   failed:   { label: 'FAILED',   color: '#ef4444', bg: 'rgba(239,68,68,0.15)',  text: '#ef4444' },
   denied:   { label: 'DENIED',   color: '#ef4444', bg: 'rgba(239,68,68,0.15)',  text: '#ef4444' },
 };
+const FILTER_LABELS = { pending_user: 'Awaiting Reply' };
 const AGENT_STATUS_COLOR = { running: '#22c55e', waiting: '#f59e0b', idle: '#555' };
 
 async function api(path, opts) {
@@ -139,9 +210,11 @@ const S = {
   taskDetail: null,
   selectedTaskId: null,
   taskFilter: 'all',
+  taskSearch: '',
   agents: [],
   sources: null,
   pivot: null,
+  profile: null,
   feed: [],
   chat: { sessionId: null, messages: [], pending: false, mode: 'chat' },
   sql: { text: '', source: null, refresh: false, result: null, error: null, running: false },
@@ -151,11 +224,14 @@ const S = {
   modifyOpen: false, modifyText: '',
   askText: '',
   error: null,
+  copiedFlash: null,
+  focusMode: false,
+  textScale: Number(localStorage.getItem('finagent_text_scale')) || 1,
 };
 
 const VIEWS = {
   dashboard: 'Dashboard', tasks: 'Tasks', agents: 'Agents',
-  sources: 'Data Sources', analysis: 'Analysis', query: 'Query',
+  sources: 'Data Sources', analysis: 'Analysis', query: 'Query', profile: 'My Usage',
 };
 const NAV = [
   { id: 'dashboard', icon: '◫', label: 'Dashboard' },
@@ -164,7 +240,12 @@ const NAV = [
   { id: 'sources', icon: '◉', label: 'Data Sources' },
   { id: 'analysis', icon: '▦', label: 'Analysis' },
   { id: 'query', icon: '💬', label: 'Query' },
+  { id: 'profile', icon: '👤', label: 'My Usage' },
 ];
+
+function applyTextScale() {
+  document.documentElement.style.setProperty('--text-scale', S.textScale);
+}
 
 /* ------------------------------------------------------------------ */
 /* Rendering                                                          */
@@ -196,10 +277,11 @@ function render() {
 
 function renderSidebar() {
   const approvalCount = S.tasks.filter(t => t.status === 'approval').length;
+  const mini = S.focusMode;
   return `
-  <div class="sidebar">
+  <div class="sidebar ${mini ? 'mini' : ''}">
     <div class="logo-row">
-      <div class="logo-mark">F</div>
+      <div class="logo-mark" ${mini ? `onclick="App.toggleFocusMode()" title="Exit focus mode"` : ''}>F</div>
       <div>
         <div class="logo-name">FinAgent</div>
         <div class="logo-sub">FINANCE OPS PLATFORM</div>
@@ -207,7 +289,7 @@ function renderSidebar() {
     </div>
     <div class="nav">
       ${NAV.map(n => `
-        <div class="nav-item ${S.view === n.id ? 'active' : ''}" onclick="App.go('${n.id}')">
+        <div class="nav-item ${S.view === n.id ? 'active' : ''}" onclick="App.go('${n.id}')" title="${mini ? esc(n.label) : ''}">
           <span class="nav-icon">${n.icon}</span><span>${n.label}</span>
           ${n.id === 'tasks' && approvalCount ? `<span class="nav-badge">${approvalCount}</span>` : ''}
         </div>`).join('')}
@@ -215,7 +297,7 @@ function renderSidebar() {
     <div class="side-agents">
       <div class="side-label">AGENTS</div>
       ${S.agents.map(a => `
-        <div class="side-agent">
+        <div class="side-agent" title="${mini ? esc(a.name) : ''}">
           <div class="dot" style="background:${AGENT_STATUS_COLOR[a.status] || '#555'}"></div>
           <span>${esc(a.name)}</span>
         </div>`).join('')}
@@ -242,6 +324,11 @@ function renderTopbar() {
       <div class="kbd-chip" onclick="App.openNewTask()" title="New task">⌘K</div>
     </div>
     <div class="topbar-right">
+      <div class="text-scale-ctl" title="Text size">
+        <button onclick="App.setTextScale(-0.1)" title="Decrease text size">A−</button>
+        <span class="text-scale-pct" onclick="App.setTextScale(0)" title="Reset text size">${Math.round(S.textScale * 100)}%</span>
+        <button onclick="App.setTextScale(0.1)" title="Increase text size">A+</button>
+      </div>
       ${S.view === 'dashboard' ? `<button class="btn-primary" onclick="App.openNewTask()">+ New Task</button>` : ''}
       <div class="live-agents"><div class="pulse"></div>${running} agent${running === 1 ? '' : 's'} running</div>
     </div>
@@ -256,8 +343,39 @@ function renderView() {
     case 'sources': return renderSources();
     case 'analysis': return renderAnalysis();
     case 'query': return renderQuery();
+    case 'profile': return renderProfile();
     default: return '';
   }
+}
+
+/* ---------- Context-window banner (shared: task detail + chat) ---------- */
+function renderContextBanner(pct, compacted) {
+  const pctLabel = Math.round((pct || 0) * 100);
+  return `
+  <div class="context-banner">
+    ${compacted
+      ? `↻ Conversation was compacted to stay within the model's context window.`
+      : `⚠ Context ${pctLabel}% full — the agent will auto-compact older turns to stay within the model's window.`}
+  </div>`;
+}
+
+/* ---------------- Profile (learned usage patterns) ---------------- */
+function renderProfile() {
+  const p = S.profile;
+  if (!p) return `<div class="empty-state">Loading…</div>`;
+  return `
+  <div class="profile-page">
+    <div class="mini-label" style="margin-bottom:8px">LEARNED FROM YOUR ACTIVITY — UPDATED NIGHTLY</div>
+    ${p.profile_text ? `
+      <div class="task-full-text-body profile-text">${mdToHtml(p.profile_text)}</div>
+      <div class="task-created" style="margin-top:10px">Last updated ${timeAgo(new Date(p.updated_at).getTime() / 1000)}</div>
+    ` : `
+      <div class="empty-state">
+        Nothing learned yet — the nightly consolidation job builds this from how you use FinAgent
+        (queries asked, sources and agents used, working patterns). Check back after it next runs.
+      </div>`}
+    ${p.error ? `<div style="color:#ef4444;font-size:12px;margin-top:10px" class="mono">${esc(p.error)}</div>` : ''}
+  </div>`;
 }
 
 /* ---------------- Dashboard ---------------- */
@@ -363,39 +481,84 @@ function freshInfo(cache) {
 
 /* ---------------- Tasks ---------------- */
 function renderTasks() {
-  const filters = ['all', 'running', 'approval', 'complete', 'queued'];
-  const matches = (t) => S.taskFilter === 'all'
-    || (S.taskFilter === 'complete' ? ['complete', 'failed', 'denied'].includes(t.status)
-        : t.status === S.taskFilter);
+  const filters = ['all', 'running', 'approval', 'pending_user', 'complete', 'queued'];
+  const q = S.taskSearch.trim().toLowerCase();
+  const matches = (t) => {
+    const statusOk = S.taskFilter === 'all'
+      || (S.taskFilter === 'complete' ? ['complete', 'failed', 'denied'].includes(t.status)
+          : t.status === S.taskFilter);
+    if (!statusOk) return false;
+    if (!q) return true;
+    const haystack = `${t.title} ${t.description} ${t.agent} ${(t.sources || []).join(' ')}`.toLowerCase();
+    return haystack.includes(q);
+  };
   const visible = S.tasks.filter(matches);
   const selected = S.taskDetail && visible.some(t => t.id === S.taskDetail.id)
     ? S.taskDetail
     : (S.taskDetail && S.tasks.some(t => t.id === S.taskDetail.id) && S.taskFilter === 'all' ? S.taskDetail : S.taskDetail);
+  const mini = S.focusMode;
   return `
   <div class="tasks-wrap">
-    <div class="task-list-col">
+    <div class="task-list-col ${mini ? 'mini' : ''}">
+      <div class="task-search">
+        <input id="task-search-input" type="text" placeholder="Search tasks…" value="${esc(S.taskSearch)}"
+          oninput="App.setTaskSearch(this.value)">
+        ${S.taskSearch ? `<button class="task-search-clear" onclick="App.setTaskSearch('')" title="Clear search">×</button>` : ''}
+      </div>
       <div class="task-filters">
         ${filters.map(f => `
           <button class="filter-chip ${S.taskFilter === f ? 'active' : ''}"
-            onclick="App.setFilter('${f}')">${f[0].toUpperCase() + f.slice(1)}</button>`).join('')}
+            onclick="App.setFilter('${f}')">${FILTER_LABELS[f] || (f[0].toUpperCase() + f.slice(1))}</button>`).join('')}
         <span class="task-count">${visible.length} tasks</span>
       </div>
       <div class="task-list">
         ${visible.length ? visible.map(t => {
           const st = STATUS_STYLE[t.status] || STATUS_STYLE.queued;
+          const initials = (t.title || '?').trim().slice(0, 2).toUpperCase();
           return `
           <div class="task-row ${S.selectedTaskId === t.id ? 'selected' : ''}"
-               style="border-left-color:${st.color}" onclick="App.goTask('${t.id}')">
+               style="border-left-color:${st.color}" onclick="App.goTask('${t.id}')" title="${mini ? esc(t.title) : ''}">
+            <span class="task-row-dot" style="background:${st.color}">${esc(initials)}</span>
             <div class="task-row-top">
               <span class="task-row-title">${esc(t.title)}</span>
               <span class="status-chip" style="color:${st.text};background:${st.bg}">${st.label}</span>
             </div>
             <div class="task-row-meta">${esc(t.agent)} · ${esc((t.sources || []).join(', ') || 'default')} · ${timeAgo(t.updated_at)}</div>
           </div>`;
-        }).join('') : `<div class="empty-state">No tasks — press + New Task</div>`}
+        }).join('') : `<div class="empty-state">${S.tasks.length ? 'No tasks match your search' : 'No tasks — press + New Task'}</div>`}
       </div>
     </div>
     <div class="task-detail">${renderTaskDetail(selected)}</div>
+  </div>`;
+}
+
+const WAITING_WORDS = ['Working on it…', 'Thinking…', 'Reasoning…', 'Almost there…'];
+
+function renderWaitingAnim() {
+  const word = WAITING_WORDS[Math.floor(_waitTick / 2.4) % WAITING_WORDS.length];
+  return `
+  <div class="waiting-anim">
+    <div class="wa-spinner">
+      <svg width="16" height="16" viewBox="0 0 16 16">
+        <circle cx="8" cy="8" r="6" fill="none" stroke="#3a3a4a" stroke-width="2"></circle>
+        <path d="M8,2 A6,6 0 0,1 14,8" fill="none" stroke="var(--amber)" stroke-width="2" stroke-linecap="round"></path>
+      </svg>
+    </div>
+    <span class="wa-text" id="wa-word">${esc(word)}</span>
+  </div>`;
+}
+
+function renderTaskStats(t) {
+  if (!t.started_at) return '';
+  const elapsedMs = t.duration_ms != null ? t.duration_ms : (Date.now() - t.started_at * 1000);
+  const totalTokens = (t.input_tokens || 0) + (t.output_tokens || 0);
+  return `
+  <div class="task-stats mono">
+    <span id="stat-duration" data-live="${t.duration_ms == null ? '1' : '0'}" data-started="${t.started_at}">${fmtDuration(elapsedMs)}</span>
+    <span class="sep">·</span>
+    <span>↓ ${fmtNum(t.input_tokens || 0)} / ↑ ${fmtNum(t.output_tokens || 0)} tokens (${fmtNum(totalTokens)} total)</span>
+    <span class="sep">·</span>
+    <span>~${fmtCost(t.estimated_llm_cost)}</span>
   </div>`;
 }
 
@@ -404,6 +567,7 @@ function renderTaskDetail(t) {
   const st = STATUS_STYLE[t.status] || STATUS_STYLE.queued;
   const a = t.approval || {};
   const isWaiting = t.status === 'approval';
+  const isActive = ['queued', 'running'].includes(t.status);
   return `
   <div class="task-detail-inner">
     <div class="task-head">
@@ -411,8 +575,37 @@ function renderTaskDetail(t) {
         <div class="task-title">${esc(t.title)}</div>
         <div class="task-created">Created ${timeAgo(t.created_at)} by ${esc(t.creator || '—')}</div>
       </div>
-      <span class="status-chip lg" style="color:${st.text};background:${st.bg}">${st.label}</span>
+      <div style="display:flex;align-items:center;gap:8px">
+        <button class="focus-toggle-btn" onclick="App.toggleFocusMode()" title="${S.focusMode ? 'Exit focus mode' : 'Expand — minimize nav & task list'}">
+          ${S.focusMode ? '⤡ Exit Focus' : '⛶ Focus'}
+        </button>
+        <span class="status-chip lg" style="color:${st.text};background:${st.bg}">${st.label}</span>
+      </div>
     </div>
+
+    <div class="task-full-text">
+      <div class="task-full-text-head">
+        <span class="mini-label">TASK DESCRIPTION</span>
+        <button class="copy-btn" onclick="App.copyTaskDescription('${t.id}')">
+          ${S.copiedFlash === 'task-desc-' + t.id ? '✓ Copied' : '📋 Copy'}
+        </button>
+      </div>
+      <div class="task-full-text-body">${esc(t.description)}</div>
+    </div>
+
+    ${t.trace_id ? `
+    <div class="task-trace-row">
+      <span class="mini-label">TRACE</span>
+      <code class="task-trace-id">${esc(t.trace_id)}</code>
+      <button class="copy-btn" onclick="App.copyTraceId('${t.id}')" title="Copy trace ID">
+        ${S.copiedFlash === 'task-trace-' + t.id ? '✓' : '📋'}
+      </button>
+      <a class="copy-btn" href="${esc(t.trace_url || '#')}" target="_blank" rel="noopener noreferrer" title="Open trace in SigNoz">🔗</a>
+    </div>` : ''}
+
+    ${renderTaskStats(t)}
+    ${(t.context_pct || 0) >= 0.75 ? renderContextBanner(t.context_pct, false) : ''}
+    ${isActive ? renderWaitingAnim() : ''}
 
     ${isWaiting ? `
     <div class="approval-banner">
@@ -452,14 +645,19 @@ function renderTaskDetail(t) {
       </div>
     </div>` : ''}
 
-    <div class="ask-bar">
+    ${(() => {
+      const busy = ['queued', 'running', 'approval'].includes(t.status);
+      return `
+    <div class="ask-bar ${busy ? 'disabled' : ''}">
       <span style="font-size:15px">💬</span>
-      <input id="ask-input" class="ask-input" placeholder="Ask about this task or its data…"
-        value="${esc(S.askText)}"
-        oninput="S.askText = this.value"
-        onkeydown="if(event.key==='Enter') App.askTask('${t.id}')"
-        ${['queued', 'running', 'approval'].includes(t.status) ? 'disabled' : ''}>
-    </div>
+      <textarea id="ask-input" class="ask-input" rows="1"
+        placeholder="${busy ? 'Agent is working — you can reply once it finishes…' : 'Ask about this task or its data… (Shift+Enter for a new line)'}"
+        oninput="S.askText = this.value; this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 90) + 'px'"
+        onkeydown="if(event.key==='Enter' && !event.shiftKey){ event.preventDefault(); App.askTask('${t.id}'); }"
+        ${busy ? 'disabled' : ''}>${esc(S.askText)}</textarea>
+      <button class="ask-send-btn" onclick="App.askTask('${t.id}')" ${busy ? 'disabled' : ''} title="Send">Send ➤</button>
+    </div>`;
+    })()}
   </div>`;
 }
 
@@ -728,6 +926,7 @@ function renderChatArea() {
           <div class="msg-avatar ${m.role}">${m.role === 'user' ? esc(initials(S.overview?.user || 'U')) : 'AI'}</div>
           <div class="msg-blocks">
             ${m.blocks.map(b => renderBlock(b, m.role)).join('')}
+            ${(m.compacted || m.contextWarning) ? renderContextBanner(m.contextPct, m.compacted) : ''}
           </div>
         </div>`).join('') : `<div class="empty-state">Ask about the finance data — e.g. “Explain variance in the ledgers between Q1 and Q2”</div>`}
       ${c.pending ? `<div class="thinking"><span class="pulse"></span>agent is querying…</div>` : ''}
@@ -987,6 +1186,33 @@ function renderConfigModal(name) {
 /* Actions                                                            */
 /* ------------------------------------------------------------------ */
 const App = {
+  async copyText(text, flashId) {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (e) { alert('Copy failed: ' + e.message); return; }
+    S.copiedFlash = flashId;
+    render();
+    setTimeout(() => {
+      if (S.copiedFlash === flashId) { S.copiedFlash = null; render(); }
+    }, 1500);
+  },
+  copyTaskDescription(taskId) {
+    const t = (S.taskDetail && S.taskDetail.id === taskId) ? S.taskDetail : S.tasks.find(x => x.id === taskId);
+    if (!t) return;
+    this.copyText(t.description, 'task-desc-' + taskId);
+  },
+  copyTraceId(taskId) {
+    const t = (S.taskDetail && S.taskDetail.id === taskId) ? S.taskDetail : S.tasks.find(x => x.id === taskId);
+    if (!t || !t.trace_id) return;
+    this.copyText(t.trace_id, 'task-trace-' + taskId);
+  },
+  toggleFocusMode() { S.focusMode = !S.focusMode; render(); },
+  setTextScale(delta) {
+    S.textScale = delta === 0 ? 1 : Math.min(1.6, Math.max(0.8, +(S.textScale + delta).toFixed(2)));
+    localStorage.setItem('finagent_text_scale', S.textScale);
+    applyTextScale();
+    render();
+  },
   go(view) {
     S.view = view;
     render();
@@ -996,6 +1222,7 @@ const App = {
     S.view = 'tasks';
     S.selectedTaskId = id;
     S.modifyOpen = !!wantModify;
+    S.focusMode = true;
     render();
     try {
       S.taskDetail = await api(`/api/tasks/${id}`);
@@ -1004,6 +1231,7 @@ const App = {
     render();
   },
   setFilter(f) { S.taskFilter = f; render(); },
+  setTaskSearch(v) { S.taskSearch = v; render(); },
   toggleModify(open, query) {
     S.modifyOpen = open;
     if (open) S.modifyText = query || '';
@@ -1092,7 +1320,10 @@ const App = {
     try {
       const res = await api('/api/query', { body: { message: text, session_id: S.chat.sessionId } });
       S.chat.sessionId = res.session_id;
-      S.chat.messages.push({ role: 'agent', blocks: res.blocks });
+      S.chat.messages.push({
+        role: 'agent', blocks: res.blocks,
+        contextPct: res.context_pct, contextWarning: res.context_warning, compacted: res.compacted,
+      });
     } catch (e) {
       S.chat.messages.push({ role: 'agent', blocks: [{ type: 'text', content: `Error: ${e.message}` }] });
     }
@@ -1193,6 +1424,11 @@ async function loadAgents() {
   try { S.agents = (await api('/api/agents')).agents; } catch (e) { /* ignore */ }
   render();
 }
+async function loadProfile() {
+  try { S.profile = await api('/api/profile'); }
+  catch (e) { S.profile = { profile_text: '', error: e.message }; }
+  render();
+}
 function loadView(view) {
   if (view === 'dashboard') { loadOverview(); refreshTasks(); }
   if (view === 'tasks') refreshTasks();
@@ -1200,6 +1436,7 @@ function loadView(view) {
   if (view === 'sources') { loadSources(); loadOverview(); }
   if (view === 'analysis') loadPivot();
   if (view === 'query') { if (!S.sources) loadSources(); }
+  if (view === 'profile') loadProfile();
 }
 
 let ws = null;
@@ -1226,15 +1463,16 @@ function connectWs() {
       if (S.taskDetail && S.taskDetail.id === t.id) {
         S.taskDetail = { ...S.taskDetail, ...t };
       }
-      if (['tasks', 'dashboard'].includes(S.view)) render();
+      if (['tasks', 'dashboard'].includes(S.view)) scheduleRender();
       if (S.view === 'dashboard') loadOverview();
     } else if (msg.type === 'log') {
       if (S.taskDetail && S.taskDetail.id === msg.data.task_id) {
         S.taskDetail.logs = [...(S.taskDetail.logs || []), msg.data.entry];
         if (S.view === 'tasks') {
-          render();
-          const box = document.getElementById('log-box');
-          if (box) box.scrollTop = box.scrollHeight;
+          scheduleRender(() => {
+            const box = document.getElementById('log-box');
+            if (box) box.scrollTop = box.scrollHeight;
+          });
         }
       }
     }
@@ -1251,8 +1489,26 @@ document.addEventListener('keydown', (e) => {
 });
 
 /* boot */
+applyTextScale();
 loadOverview();
 refreshTasks();
 loadAgents();
 connectWs();
 setInterval(() => { if (S.view === 'dashboard') loadOverview(); }, 15000);
+
+/* Waiting-animation ticker: cycles the status word and updates the
+   elapsed-time readout in place, without a full re-render — a full
+   render() every second would tear down and recreate the whole task
+   panel, restarting its CSS animations and reading as a "blink". */
+let _waitTick = 0;
+setInterval(() => {
+  _waitTick++;
+  const t = S.taskDetail;
+  if (!t || !['queued', 'running'].includes(t.status)) return;
+  const wordEl = document.getElementById('wa-word');
+  if (wordEl) wordEl.textContent = WAITING_WORDS[Math.floor(_waitTick / 2.4) % WAITING_WORDS.length];
+  const durEl = document.getElementById('stat-duration');
+  if (durEl && durEl.dataset.live === '1') {
+    durEl.textContent = fmtDuration(Date.now() - Number(durEl.dataset.started) * 1000);
+  }
+}, 1000);

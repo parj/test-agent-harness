@@ -37,9 +37,14 @@ _DEFAULT_SQL = (
 class StubProvider(Provider):
     def complete(self, messages, system, tools=None, reasoning_effort=None) -> LLMResponse:
         last = messages[-1] if messages else {}
+        # Deterministic offline stand-in for real usage accounting — same
+        # chars/4 heuristic as agent/context.py's estimate_tokens, just
+        # enough to exercise context-window-percentage logic in tests
+        # without a live API.
+        input_tokens = max(1, sum(len(str(m.get("content", ""))) for m in messages) // 4)
 
         if last.get("role") == "tool_result":
-            return LLMResponse(text=self._summarize(last), input_tokens=0, output_tokens=0)
+            return LLMResponse(text=self._summarize(last), input_tokens=input_tokens, output_tokens=0)
 
         user_text = ""
         for m in reversed(messages):
@@ -63,6 +68,7 @@ class StubProvider(Provider):
             text="Let me query the data.",
             tool_calls=[ToolCall(id=f"stub_{uuid.uuid4().hex[:8]}", name="query_data",
                                  input=call_input)],
+            input_tokens=input_tokens,
         )
 
     # ------------------------------------------------------------------ #

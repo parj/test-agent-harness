@@ -47,11 +47,36 @@ async def test_task_runs_to_completion(client):
         "require_approval": False,
     })
     assert r.status_code == 200
-    task = await _wait_for_status(client, r.json()["id"], {"complete", "failed"})
-    assert task["status"] == "complete"
+    task = await _wait_for_status(client, r.json()["id"], {"pending_user", "failed"})
+    assert task["status"] == "pending_user"
     assert any(b["type"] == "table" for b in task["blocks"])
     assert "Largest movers" in task["result_text"]
     assert task["logs"]
+
+
+@pytest.mark.asyncio
+async def test_task_pending_user_then_idle_timeout(client, monkeypatch):
+    monkeypatch.setattr(settings, "task_followup_idle_seconds", 0.2)
+
+    r = await client.post("/api/tasks", json={
+        "description": "Explain variance in the ledgers between Q1 and Q2",
+        "agent": "Variance Agent",
+        "require_approval": False,
+    })
+    task_id = r.json()["id"]
+    task = await _wait_for_status(client, task_id, {"pending_user", "failed"})
+    assert task["status"] == "pending_user"
+
+    # A follow-up while pending_user is allowed (not blocked like queued/running/approval).
+    r = await client.post(f"/api/tasks/{task_id}/ask", json={"message": "What about vendor spend?"})
+    assert r.status_code == 200
+
+    task = await _wait_for_status(client, task_id, {"pending_user", "failed"})
+    assert task["status"] == "pending_user"
+
+    # No further follow-up — auto-completes after the (shortened) idle window.
+    task = await _wait_for_status(client, task_id, {"complete"}, timeout=5.0)
+    assert task["status"] == "complete"
 
 
 @pytest.mark.asyncio
@@ -79,8 +104,8 @@ async def test_approval_lifecycle(client, monkeypatch):
     })
     assert r.status_code == 200
 
-    task = await _wait_for_status(client, task_id, {"complete", "failed", "denied"})
-    assert task["status"] == "complete"
+    task = await _wait_for_status(client, task_id, {"pending_user", "failed", "denied"})
+    assert task["status"] == "pending_user"
 
     r = await client.post(f"/api/tasks/{task_id}/approval", json={"decision": "approve"})
     assert r.status_code == 409
@@ -101,7 +126,7 @@ async def test_denied_task(client, monkeypatch):
     await _wait_for_status(client, task_id, {"approval"})
     await client.post(f"/api/tasks/{task_id}/approval",
                       json={"decision": "deny", "note": "too costly"})
-    task = await _wait_for_status(client, task_id, {"denied", "complete", "failed"})
+    task = await _wait_for_status(client, task_id, {"denied", "pending_user", "failed"})
     assert task["status"] == "denied"
 
 
