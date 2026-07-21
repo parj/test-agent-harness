@@ -8,6 +8,74 @@ const esc = (s) => String(s ?? '')
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
+/* Minimal markdown -> HTML for LLM-written text blocks (headings, bold/italic,
+   inline code, code fences, lists, links). Escapes first, then only ever
+   inserts tags around already-escaped text, so it stays XSS-safe. */
+function mdInline(s) {
+  return esc(s)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, '$1<em>$2</em>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+}
+function mdToHtml(text) {
+  const lines = String(text ?? '').replace(/\r\n/g, '\n').split('\n');
+  const out = [];
+  let list = null; // {type, items}
+  const flushList = () => {
+    if (list) out.push(`<${list.type}>${list.items.map(it => `<li>${mdInline(it)}</li>`).join('')}</${list.type}>`);
+    list = null;
+  };
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.trim().startsWith('```')) {
+      flushList();
+      const code = [];
+      i++;
+      while (i < lines.length && !lines[i].trim().startsWith('```')) { code.push(lines[i]); i++; }
+      i++;
+      out.push(`<pre class="md-code"><code>${esc(code.join('\n'))}</code></pre>`);
+      continue;
+    }
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    if (h) {
+      flushList();
+      const level = Math.min(h[1].length, 6);
+      out.push(`<h${level} class="md-h">${mdInline(h[2])}</h${level}>`);
+      i++;
+      continue;
+    }
+    const ul = line.match(/^\s*[-*]\s+(.*)$/);
+    if (ul) {
+      if (!list || list.type !== 'ul') { flushList(); list = { type: 'ul', items: [] }; }
+      list.items.push(ul[1]);
+      i++;
+      continue;
+    }
+    const ol = line.match(/^\s*\d+\.\s+(.*)$/);
+    if (ol) {
+      if (!list || list.type !== 'ol') { flushList(); list = { type: 'ol', items: [] }; }
+      list.items.push(ol[1]);
+      i++;
+      continue;
+    }
+    flushList();
+    if (line.trim() === '') { i++; continue; }
+    const para = [line];
+    i++;
+    while (i < lines.length && lines[i].trim() !== ''
+           && !/^(#{1,6})\s+/.test(lines[i]) && !/^\s*[-*]\s+/.test(lines[i])
+           && !/^\s*\d+\.\s+/.test(lines[i]) && !lines[i].trim().startsWith('```')) {
+      para.push(lines[i]);
+      i++;
+    }
+    out.push(`<p>${mdInline(para.join(' '))}</p>`);
+  }
+  flushList();
+  return out.join('');
+}
+
 function timeAgo(epoch) {
   if (!epoch) return '—';
   const s = Math.max(0, (Date.now() / 1000) - epoch);
@@ -78,7 +146,7 @@ const S = {
   chat: { sessionId: null, messages: [], pending: false, mode: 'chat' },
   sql: { text: '', source: null, refresh: false, result: null, error: null, running: false },
   modal: null,           // 'newtask' | 'addsource' | {type:'config', name}
-  newTask: { description: '', agent: 'Recon Agent', sources: [], priority: 'medium', approval: true },
+  newTask: { description: '', agent: 'Recon Agent', sources: [], reasoningEffort: 'medium', approval: true },
   newSource: { name: '', kind: 'clickhouse', params: {} },
   modifyOpen: false, modifyText: '',
   askText: '',
@@ -727,7 +795,8 @@ function renderSqlResult(r) {
 
 function renderBlock(b, role) {
   if (b.type === 'text') {
-    return `<div class="block-text ${role}">${esc(b.content)}</div>`;
+    const body = role === 'agent' ? mdToHtml(b.content) : esc(b.content);
+    return `<div class="block-text ${role}">${body}</div>`;
   }
   if (b.type === 'table') {
     const meta = b.meta || {};
@@ -806,11 +875,11 @@ function renderNewTaskModal() {
           </div>
         </div>
         <div>
-          <label class="field-label">PRIORITY</label>
+          <label class="field-label">REASONING EFFORT</label>
           <div class="chip-row">
-            ${['low', 'medium', 'high', 'critical'].map(p => `
-              <button class="pick-chip ${nt.priority === p ? 'amber' : ''}"
-                onclick="S.newTask.priority='${p}'; render()">${p[0].toUpperCase() + p.slice(1)}</button>`).join('')}
+            ${['low', 'medium', 'high'].map(p => `
+              <button class="pick-chip ${nt.reasoningEffort === p ? 'amber' : ''}"
+                onclick="S.newTask.reasoningEffort='${p}'; render()">${p[0].toUpperCase() + p.slice(1)}</button>`).join('')}
           </div>
         </div>
         <div class="toggle-row" onclick="S.newTask.approval = !S.newTask.approval; render()">
@@ -951,7 +1020,7 @@ const App = {
   },
   openNewTask() {
     S.modal = 'newtask';
-    S.newTask = { description: '', agent: S.agents[0]?.name || 'Recon Agent', sources: [], priority: 'medium', approval: true };
+    S.newTask = { description: '', agent: S.agents[0]?.name || 'Recon Agent', sources: [], reasoningEffort: 'medium', approval: true };
     render();
     setTimeout(() => document.getElementById('nt-desc')?.focus(), 30);
   },
@@ -968,7 +1037,7 @@ const App = {
         description: S.newTask.description,
         agent: S.newTask.agent,
         sources: S.newTask.sources,
-        priority: S.newTask.priority,
+        reasoning_effort: S.newTask.reasoningEffort,
         require_approval: S.newTask.approval,
       }});
       S.modal = null;

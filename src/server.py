@@ -83,7 +83,7 @@ class Task:
     description: str
     agent: str
     sources: list[str]
-    priority: str = "medium"
+    reasoning_effort: str = "medium"
     require_approval: bool = True
     status: str = "queued"          # queued | running | approval | complete | failed | denied
     created_at: float = field(default_factory=time.time)
@@ -101,7 +101,7 @@ class Task:
     def to_json(self, with_detail: bool = True):
         base = {
             "id": self.id, "title": self.title, "description": self.description,
-            "agent": self.agent, "sources": self.sources, "priority": self.priority,
+            "agent": self.agent, "sources": self.sources, "reasoning_effort": self.reasoning_effort,
             "require_approval": self.require_approval, "status": self.status,
             "created_at": self.created_at, "updated_at": self.updated_at,
             "creator": self.creator, "approval": self.approval,
@@ -348,6 +348,7 @@ async def _run_task(task: Task):
             system_prompt=_system_prompt_for(task.agent),
             approval_handler=approval_handler,
             approvals_enabled=task.require_approval,
+            reasoning_effort=task.reasoning_effort,
         )
         new_messages = messages[len(conversation):]
         task.messages = messages
@@ -385,7 +386,7 @@ class CreateTaskBody(BaseModel):
     description: str
     agent: str = "Recon Agent"
     sources: list[str] = []
-    priority: str = "medium"
+    reasoning_effort: str = "medium"
     require_approval: bool = True
     title: Optional[str] = None
 
@@ -478,7 +479,7 @@ async def create_task(body: CreateTaskBody):
         description=body.description,
         agent=body.agent,
         sources=body.sources,
-        priority=body.priority,
+        reasoning_effort=body.reasoning_effort,
         require_approval=body.require_approval,
         creator=settings.demo_user,
     )

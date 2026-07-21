@@ -47,6 +47,7 @@ class AgentRuntime:
         system_prompt: str | None = None,
         approval_handler=None,
         approvals_enabled: bool = True,
+        reasoning_effort: str | None = None,
     ) -> tuple[str, list[dict]]:
         """
         Runs the reasoning loop for one user turn. `conversation` and the
@@ -60,6 +61,9 @@ class AgentRuntime:
         `approval_handler`, if given, is an async callable
         (ApprovalRequest, ToolCall) -> ApprovalDecision awaited whenever a
         tool's approval check fires.
+
+        `reasoning_effort`, if given, is passed to the provider on every
+        call in this loop (see providers/base.py:REASONING_EFFORTS).
         """
         messages = list(conversation)
         active_system_prompt = system_prompt or SYSTEM_PROMPT
@@ -69,6 +73,7 @@ class AgentRuntime:
             response = await asyncio.to_thread(
                 self.provider.complete, messages,
                 system=active_system_prompt, tools=tool_schemas,
+                reasoning_effort=reasoning_effort,
             )
 
             if on_event:
@@ -86,6 +91,7 @@ class AgentRuntime:
                     {"id": tc.id, "name": tc.name, "input": tc.input}
                     for tc in response.tool_calls
                 ],
+                "thinking_blocks": response.thinking_blocks,
             })
 
             if not response.tool_calls:

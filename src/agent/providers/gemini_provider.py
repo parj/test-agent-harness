@@ -4,13 +4,17 @@ fine for one call per tool per turn."""
 from agent.providers.base import LLMResponse, Provider, ToolCall
 from config import settings
 
+# Thinking-token budgets per effort level, mirroring the Anthropic adapter —
+# Gemini's thinking_budget is also a token count, not a named level.
+_THINKING_BUDGETS = {"low": 1024, "medium": 4096, "high": 16000}
+
 
 class GeminiProvider(Provider):
     def __init__(self):
         from google import genai
         self.client = genai.Client(api_key=settings.gemini_api_key)
 
-    def complete(self, messages, system, tools=None) -> LLMResponse:
+    def complete(self, messages, system, tools=None, reasoning_effort=None) -> LLMResponse:
         from google.genai import types
 
         contents = []
@@ -42,14 +46,26 @@ class GeminiProvider(Provider):
             for t in (tools or [])
         ]
 
-        response = self.client.models.generate_content(
-            model=settings.gemini_model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=system,
-                tools=[types.Tool(function_declarations=declarations)] if declarations else None,
-            ),
+        config_kwargs = dict(
+            system_instruction=system,
+            tools=[types.Tool(function_declarations=declarations)] if declarations else None,
         )
+        budget = _THINKING_BUDGETS.get(reasoning_effort)
+        try:
+            response = self.client.models.generate_content(
+                model=settings.gemini_model, contents=contents,
+                config=types.GenerateContentConfig(
+                    **config_kwargs,
+                    thinking_config=types.ThinkingConfig(thinking_budget=budget) if budget else None,
+                ),
+            )
+        except Exception:
+            # Configured model doesn't support thinking_config — retry without it
+            # rather than failing the whole task.
+            response = self.client.models.generate_content(
+                model=settings.gemini_model, contents=contents,
+                config=types.GenerateContentConfig(**config_kwargs),
+            )
 
         text_parts, tool_calls = [], []
         candidate = response.candidates[0] if response.candidates else None

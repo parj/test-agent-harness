@@ -35,7 +35,7 @@ _DEFAULT_SQL = (
 
 
 class StubProvider(Provider):
-    def complete(self, messages, system, tools=None) -> LLMResponse:
+    def complete(self, messages, system, tools=None, reasoning_effort=None) -> LLMResponse:
         last = messages[-1] if messages else {}
 
         if last.get("role") == "tool_result":
