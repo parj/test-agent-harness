@@ -1,116 +1,169 @@
-# FinOps Agent
- 
-A Hermes/OpenClaw-style AI agent for finance operations — reconciliation, variance analysis, cash reporting — built from scratch. Provider-agnostic (Claude, GPT, or Gemini), with persistent memory and markdown-defined skills.
- 
+# FinAgent — FinOps Agent Harness
+
+A finance-operations AI agent platform — reconciliation, variance analysis, cash
+reporting — with a full web UI (the **FinAgent** design), a REST + WebSocket API,
+multi-datasource connectors, and a **ClickHouse-backed query cache**.
+Provider-agnostic (Claude, GPT, Gemini, or an offline stub for testing), with
+markdown-defined skills.
+
 See `plan.md` for what's built, what's tested, and what's left.
- 
+
 ---
- 
-## Setup
- 
+
+## Quick start (no external services needed)
+
 ```bash
 # 1. Python environment
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
- 
-# 2. Sample finance data (SQLite — used by the query_data tool)
+
+# 2. Seed sample finance data (two DuckDB files + datasource config)
 cd src
 python -m db.seed
- 
-# 3. Postgres for memory (only needed for Phase 2 features — skip if you
-#    just want the Phase 1 chat loop)
-cd ..
-docker compose up -d
-cd src
-python -m db.database    # creates schema, enables pgvector
+
+# 3. Run the server (offline stub provider — no API key required)
+PROVIDER=stub python -m uvicorn server:app --port 8720
 ```
- 
-## Configuration
- 
-All config is environment variables (see `src/config.py` for the full list). Minimum to run:
- 
+
+Open http://localhost:8720 — the FinAgent UI: Dashboard, Tasks (with the
+approve/deny/modify flow for expensive queries), Agents, Data Sources,
+Analysis (pivot straight off the ClickHouse cache), and Query (chat +
+structured SQL).
+
+To use a real LLM instead of the stub:
+
 ```bash
 export PROVIDER=anthropic              # or: openai | gemini
-export ANTHROPIC_API_KEY=sk-ant-...    # matching key for whichever provider
+export ANTHROPIC_API_KEY=sk-ant-...    # matching key for the provider
 ```
- 
-For semantic memory (Phase 2), embeddings always go through OpenAI regardless of chat provider:
- 
+
+If the configured provider has no API key, the harness automatically falls
+back to the stub so it always runs.
+
+## Datasources
+
+Four connector kinds are supported: **clickhouse**, **postgres**, **duckdb**,
+**trino**. Connected sources are declared in `sample_data/datasources.json`
+(created by the seed script) and can also be added live from the UI
+(Data Sources → *+ Add Source*) or via `POST /api/sources`:
+
+```json
+{
+  "default": "finops_erp",
+  "sources": [
+    {"name": "finops_erp", "kind": "duckdb",     "params": {"path": "finops.duckdb"}},
+    {"name": "app_db",     "kind": "postgres",   "params": {"dsn": "postgresql://user:pass@host:5432/db"}},
+    {"name": "warehouse",  "kind": "clickhouse", "params": {"host": "ch.internal", "port": 8123, "database": "prod"}},
+    {"name": "lakehouse",  "kind": "trino",      "params": {"host": "trino.internal", "port": 8080, "catalog": "hive", "schema": "finance"}}
+  ]
+}
+```
+
+## The ClickHouse cache
+
+Every result the agent pulls from an origin datasource is written into
+ClickHouse, keyed by a fingerprint of `(source, sql)`. While the entry is
+fresh (`CACHE_TTL_SECONDS`, default 15 min), the same query is served from
+ClickHouse without touching the origin. Full-table pulls also get a stable
+view (`<source>__<table>`), so follow-up analysis — the pivot view, drill-down
+chat questions, ad-hoc SQL — runs against ClickHouse too.
+
+Two interchangeable backends, same SQL semantics:
+
+- **`CLICKHOUSE_URL=http://host:8123` set** → a real ClickHouse server via
+  clickhouse-connect.
+- **Not set** → [chdb](https://github.com/chdb-io/chdb), the embedded
+  in-process ClickHouse engine, persisted under `sample_data/chdb-cache`.
+  This is what the test harness uses — no server required.
+
+Queries whose estimated row count exceeds `APPROVAL_ROW_THRESHOLD` (default
+100K) pause for human approval when the task requires it; the UI offers
+Approve / Deny / Modify-query. Cache hits are never gated.
+
+## API surface
+
+| Route | What it does |
+|---|---|
+| `GET /api/overview` | dashboard stats, approval queue, feed, cache freshness per source |
+| `GET/POST /api/tasks`, `GET /api/tasks/{id}` | task list / create (runs the agent) / detail with logs + result blocks |
+| `POST /api/tasks/{id}/approval` | `{"decision": "approve" \| "deny" \| "modify", "modified_query": …}` |
+| `POST /api/tasks/{id}/ask` | follow-up question in the task's context |
+| `GET /api/agents` | agent roster with live status/progress/cost |
+| `GET/POST /api/sources`, `POST /api/sources/{name}/refresh` | list/add sources, invalidate a source's cache |
+| `POST /api/query` | natural-language chat → agent → blocks (text/table/chart) |
+| `POST /api/sql` | direct SELECT through the cache |
+| `GET /api/analysis/pivot` | Q1/Q2 pivot + variance drivers + monthly trends, computed in ClickHouse |
+| `GET /api/cache/entries` | raw cache entries with freshness |
+| `WS /ws` | live events: feed, task updates, agent logs, approval requests |
+
+## Running the tests
+
 ```bash
-export OPENAI_API_KEY=sk-...
+pytest            # 44 tests: tools, datasources, cache, agent loop, API
 ```
- 
-For Postgres (Phase 2), defaults assume the Docker Compose service:
- 
-```bash
-export POSTGRES_DSN=postgresql://finops:localdev@localhost:5432/finops
-```
- 
-## Running it
- 
-```bash
-cd src
-python chat_cli.py
-```
- 
-Try: *"What did we spend on digital advertising this quarter?"* — the agent writes and runs the SQL itself against the seeded sample data.
- 
+
+The suite is fully offline: seeded DuckDB as the origin, chdb as the
+ClickHouse cache, stub provider as the LLM.
+
 ## Project structure
- 
+
 ```
-finops-agent/
-├── docker-compose.yml       # Postgres + pgvector, for Phase 2 memory
+finance-agent-harness/
+├── docker-compose.yml        # Postgres + pgvector, for Phase 2 memory
 ├── requirements.txt
-├── sample_data/
-│   └── finops.db            # seeded SQLite data (chart of accounts, transactions, budget)
-├── skills/                  # markdown workflow definitions, loaded at runtime
-│   ├── bank_reconciliation.md
-│   ├── variance_analysis.md
-│   └── daily_cash_report.md
+├── sample_data/              # generated: finops.duckdb, bank_feed.duckdb,
+│                             #   datasources.json, chdb-cache/
+├── skills/                   # markdown workflow definitions, loaded at runtime
+├── tests/                    # offline pytest suite
 └── src/
-    ├── config.py            # all settings, via environment variables
+    ├── config.py             # all settings, via environment variables
+    ├── server.py             # FastAPI app: REST + WS + static UI
     ├── chat_cli.py           # terminal chat loop for testing
+    ├── static/               # FinAgent web UI (vanilla JS, no build step)
     ├── agent/
-    │   ├── runtime.py        # core reasoning loop (provider-agnostic)
-    │   ├── context.py        # assembles system prompt: skill + memories + history
-    │   └── providers/         # one adapter per LLM backend
-    │       ├── base.py
-    │       ├── anthropic_provider.py
-    │       ├── openai_provider.py
-    │       └── gemini_provider.py
+    │   ├── runtime.py        # core reasoning loop + approval gating
+    │   ├── context.py        # system prompt assembly: skill + memories
+    │   └── providers/        # anthropic / openai / gemini / stub adapters
     ├── tools/
-    │   ├── base.py            # @tool decorator, registry, schema generation
-    │   └── query.py           # query_data — sandboxed SQL against finops.db
-    ├── memory/
-    │   ├── sessions.py         # conversation persistence (Postgres)
-    │   ├── semantic.py         # long-term memory via embeddings (pgvector)
-    │   └── skills.py           # markdown skill file loader
+    │   ├── base.py           # @tool decorator, registry, approval checks
+    │   └── query.py          # query_data — SELECT-only, cache-aware
+    ├── datasources/
+    │   ├── base.py           # connector interface + SQL guard
+    │   ├── clickhouse_source.py / postgres_source.py /
+    │   │   duckdb_source.py / trino_source.py
+    │   └── registry.py       # config-driven source manager
+    ├── cache/
+    │   ├── backends.py       # chdb (embedded) / clickhouse-connect (server)
+    │   └── manager.py        # fingerprint → cache table + TTL + views
+    ├── memory/               # sessions, semantic memory, skills (Phase 2)
     └── db/
-        ├── seed.py            # generates sample_data/finops.db
-        └── database.py        # Postgres pool + schema DDL
+        ├── seed.py           # sample finance data generator
+        └── database.py       # Postgres pool + schema DDL (Phase 2)
 ```
- 
-## Switching LLM providers
- 
-No code changes needed — just environment variables:
- 
-```bash
-export PROVIDER=openai
-export OPENAI_API_KEY=sk-...
-```
- 
-```bash
-export PROVIDER=gemini
-export GEMINI_API_KEY=...
-```
- 
-Each provider translates the same internal tool registry and conversation format into its own wire format — see `agent/providers/base.py` for the shared interface.
- 
+
+## Environment variables
+
+Everything is configured via environment variables — see `src/config.py`
+for the full list. The interesting ones:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PROVIDER` | `anthropic` | `anthropic` \| `openai` \| `gemini` \| `stub` |
+| `CLICKHOUSE_URL` | *(empty)* | use a real ClickHouse server for the cache |
+| `CHDB_DIR` | `sample_data/chdb-cache` | embedded cache location |
+| `CACHE_TTL_SECONDS` | `900` | cache freshness window |
+| `APPROVAL_ROW_THRESHOLD` | `100000` | rows above which queries need approval |
+| `RESULT_ROW_LIMIT` | `500` | rows returned to the model / UI per query |
+| `DATASOURCES_CONFIG` | `sample_data/datasources.json` | source registry file |
+
 ## Known limitations (see plan.md for full detail)
- 
-- Gemini tool calls use the function name as a stand-in call ID (Gemini doesn't return one); fine for one tool call per turn, not yet safe for repeated calls to the same tool in a single turn.
-- The Postgres/pgvector layer (`memory/sessions.py`, `memory/semantic.py`) is written and internally consistent but not tested against a live database — this sandbox couldn't run Postgres. Verify with `python -m db.database` before trusting it in anger.
-- No persistence wiring yet between `chat_cli.py` and the memory layer — sessions aren't actually saved or resumed, and memory extraction isn't triggered automatically. The pieces exist; the glue doesn't yet.
-- Token counting in `context.py` is a `len(text) // 4` heuristic, not a real tokenizer. Fine for triggering summarisation, not for billing accuracy.
- 
+
+- Gemini tool calls use the function name as a stand-in call ID (Gemini
+  doesn't return one); fine for one tool call per turn.
+- The Postgres/pgvector memory layer (`memory/`) is written but not wired
+  into the server — tasks and chat sessions are in-memory.
+- Postgres, ClickHouse-as-origin, and Trino connectors are implemented and
+  share the tested interface, but only DuckDB (origin) and chdb (cache) are
+  exercised live in this sandbox — point real DSNs at them to verify in anger.
+- Token counting in `context.py` is a `len(text) // 4` heuristic.

@@ -10,11 +10,20 @@ from openai import OpenAI
 from config import settings
 from db.database import get_pool
 
-_embed_client = OpenAI(api_key=settings.embedding_api_key)
+_embed_client: OpenAI | None = None
+
+
+def _client() -> OpenAI:
+    # Lazy so importing this module never requires OPENAI_API_KEY — only
+    # actually embedding does.
+    global _embed_client
+    if _embed_client is None:
+        _embed_client = OpenAI(api_key=settings.embedding_api_key)
+    return _embed_client
 
 
 def embed_text(text: str) -> list[float]:
-    response = _embed_client.embeddings.create(model=settings.embedding_model, input=text)
+    response = _client().embeddings.create(model=settings.embedding_model, input=text)
     return response.data[0].embedding
 
 

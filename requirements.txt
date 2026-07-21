@@ -17,3 +17,28 @@ asyncpg==0.31.0            # Postgres driver for sessions/messages/memories
 # in memory/semantic.py, so no separate pgvector Python package is needed —
 # just the Postgres extension itself (already in the pgvector/pgvector:pg16
 # Docker image used by docker-compose.yml).
+
+# --- Web app (Phase 3: UI + API) ---
+fastapi==0.139.2
+uvicorn[standard]==0.51.0
+websockets==16.1.1
+
+# --- Datasources ---
+duckdb==1.5.4              # embedded analytical DB; sample data ships as one
+clickhouse-connect==1.5.0  # ClickHouse server connector (origin + cache backend)
+psycopg[binary]==3.3.4     # PostgreSQL connector
+trino==0.338.0             # Trino connector
+
+# --- Excel ingestion (db/load_excel_ledgers.py) ---
+pandas==3.0.3
+openpyxl==3.1.5            # .xlsx
+xlrd==2.0.2                # legacy .xls
+
+# --- ClickHouse cache, embedded fallback ---
+chdb==4.2.1                # in-process ClickHouse engine; used when no
+                           # CLICKHOUSE_URL is configured (the test harness path)
+
+# --- Tests ---
+pytest==9.1.1
+pytest-asyncio==1.4.0
+httpx==0.28.1
