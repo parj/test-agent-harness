@@ -127,12 +127,37 @@ def setup_telemetry(app) -> None:
     )
     otel_logs.set_logger_provider(api_logger_provider)
     logging.getLogger().addHandler(LoggingHandler(logger_provider=api_logger_provider))
+    # Nothing in this app ever called logging.basicConfig(), so root has no
+    # console handler of its own — app-level `logging.getLogger(__name__)`
+    # calls (task persistence, activity logging, etc.) were only ever
+    # visible via OTel, never in `docker compose logs`. Give root a plain
+    # StreamHandler too so those show up in both places, same as uvicorn's.
+    # Skip records from "uvicorn"/"uvicorn.access" here — they already get
+    # console output from their own dedicated handlers (see below); without
+    # the filter, once we make them propagate, they'd print twice.
+    console_handler = logging.StreamHandler()
+    console_handler.addFilter(lambda record: not record.name.startswith("uvicorn"))
+    logging.getLogger().addHandler(console_handler)
     # Root defaults to WARNING, which would filter out our own info-level
-    # diagnostics (task persistence, activity logging, etc.) before they
-    # ever reach the handler above — INFO is the right floor for an app
-    # this size; revisit if third-party libs get noisy at that level.
+    # diagnostics before they ever reach either handler above — INFO is the
+    # right floor for an app this size; revisit if third-party libs get
+    # noisy at that level.
     if logging.getLogger().getEffectiveLevel() > logging.INFO:
         logging.getLogger().setLevel(logging.INFO)
+
+    # uvicorn/fastapi ship their own dictConfig (applied before this module
+    # is even imported — Config.__init__ configures logging, *then* imports
+    # the app) that gives "uvicorn" and "uvicorn.access" their own console
+    # StreamHandlers with propagate=False. That's what puts "Started server
+    # process", "Uvicorn running on...", and the per-request access lines on
+    # stdout — and, because propagate is off, keeps them from ever reaching
+    # the root handler above, so none of it reached the collector. Flipping
+    # propagate back on lets those records still hit their own console
+    # handler *and* bubble up to root for OTLP export; "uvicorn.error" has
+    # no handler of its own and propagates into "uvicorn", so fixing that
+    # one logger covers it too.
+    logging.getLogger("uvicorn").propagate = True
+    logging.getLogger("uvicorn.access").propagate = True
 
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
     FastAPIInstrumentor.instrument_app(app, tracer_provider=api_tracer_provider)

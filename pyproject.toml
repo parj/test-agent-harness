@@ -4,4 +4,33 @@ version = "0.2.0"
 description = "FinAgent — finance ops agent harness with web UI, multi-datasource support, and a ClickHouse query cache"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "anthropic==0.116.0",
+    "openai==2.44.0",
+    "google-genai==2.10.0",
+    "pydantic==2.13.4",
+    "asyncpg==0.31.0",
+    "fastapi==0.139.2",
+    "fastapi[standard]==0.139.2",
+    "websockets==16.1.1",
+    "duckdb==1.5.4",
+    "clickhouse-connect==1.5.0",
+    "psycopg[binary]==3.3.4",
+    "trino==0.338.0",
+    "pandas==3.0.3",
+    "openpyxl==3.1.5",
+    "xlrd==2.0.2",
+    "chdb==4.2.1",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "httpx==0.28.1",
+    "opentelemetry-api==1.39.0",
+    "opentelemetry-sdk==1.39.0",
+    "opentelemetry-exporter-otlp-proto-http==1.39.0",
+    "opentelemetry-instrumentation-fastapi==0.60b0",
+    "opentelemetry-instrumentation-httpx==0.60b0",
+    "opentelemetry-instrumentation-asyncpg==0.60b0",
+]
+
+[tool.fastapi]
+entrypoint = "server:app"

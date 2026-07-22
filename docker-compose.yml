@@ -13,6 +13,19 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+  agent:
+    build: .
+    ports:
+      - "8720:8720"
+    environment:
+      POSTGRES_DSN: postgresql://finops:localdev@postgres:5432/finops
+      PROVIDER: ${PROVIDER:-openai}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://host.docker.internal:4318
+
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
   pgdata:

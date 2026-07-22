@@ -1,0 +1,8 @@
+.claude
+.pytest_cache
+.venv
+tests
+.gitignore
+docker-compose.yml
+*.md
+pytest.ini

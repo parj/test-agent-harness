@@ -11,3 +11,7 @@ wheels/
 
 # Generated sample data + local ClickHouse cache
 sample_data/
+
+.pytest_cache/
+
+.claude/

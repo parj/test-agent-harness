@@ -5,9 +5,13 @@ the pgvector/pgvector:pg16 Docker image ships it, this just enables it.
 Run once after `docker compose up -d`:
     python -m db.database
 """
+import logging
+
 import asyncpg
 
 from config import settings
+
+logger = logging.getLogger(__name__)
 
 _pool: asyncpg.Pool | None = None
 
@@ -115,7 +119,7 @@ async def init_db():
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(DDL)
-    print("Schema ready: sessions, messages, memories, tasks, activity_log, user_profiles.")
+    logger.info("Schema ready: sessions, messages, memories, tasks, activity_log, user_profiles.")
 
 
 if __name__ == "__main__":
